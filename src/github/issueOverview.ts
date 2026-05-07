@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 'use strict';
 
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { CloseResult, OpenLocalFileArgs } from '../../common/views';
 import { openPullRequestOnGitHub } from '../commands';
@@ -12,7 +13,7 @@ import { GithubItemStateEnum, IAccount, IMilestone, IProject, IProjectItem, Repo
 import { IssueModel } from './issueModel';
 import { getAssigneesQuickPickItems, getLabelOptions, getMilestoneFromQuickPick, getProjectFromQuickPick } from './quickPicks';
 import { isInCodespaces, processPermalinks, vscodeDevPrLink } from './utils';
-import { ChangeAssigneesReply, DisplayLabel, Issue, ProjectItemsReply, SubmitReviewReply, UnresolvedIdentity } from './views';
+import { ChangeAssigneesReply, DisplayLabel, FileUploadCompletedMessage, Issue, ProjectItemsReply, SubmitReviewReply, UnresolvedIdentity, UploadFilesReply } from './views';
 import { COPILOT_ACCOUNTS, IComment } from '../common/comment';
 import { emojify, ensureEmojis } from '../common/emoji';
 import Logger from '../common/logger';
@@ -452,6 +453,8 @@ export class IssueOverviewPanel<TItem extends IssueModel = IssueModel> extends W
 				return this.openLocalFile(message);
 			case 'pr.debug':
 				return this.webviewDebug(message);
+			case 'pr.upload-files':
+				return this.uploadFiles(message);
 			default:
 				return this.MESSAGE_UNHANDLED;
 		}
@@ -572,6 +575,75 @@ export class IssueOverviewPanel<TItem extends IssueModel = IssueModel> extends W
 	private webviewDebug(message: IRequestMessage<string>): void {
 		Logger.debug(message.args, IssueOverviewPanel.ID);
 	}
+
+	private async uploadFiles(message: IRequestMessage<void>): Promise<void> {
+		const fileUris = await vscode.window.showOpenDialog({
+			canSelectMany: true,
+			canSelectFiles: true,
+			canSelectFolders: false,
+			openLabel: 'Upload',
+			title: 'Select files to upload',
+		});
+		if (!fileUris || fileUris.length === 0) {
+			const empty: UploadFilesReply = { uploads: [] };
+			return this._replyMessage(message, empty);
+		}
+
+		const used = new Map<string, number>();
+		const uploads = fileUris.map(uri => {
+			const baseName = path.basename(uri.fsPath);
+			const count = used.get(baseName) ?? 0;
+			used.set(baseName, count + 1);
+			const placeholder = count === 0
+				? `<!-- Uploading ${baseName} -->`
+				: `<!-- Uploading ${baseName} (${count + 1}) -->`;
+			return { uri, name: baseName, placeholder };
+		});
+
+		const reply: UploadFilesReply = { uploads: uploads.map(u => ({ name: u.name, placeholder: u.placeholder })) };
+		await this._replyMessage(message, reply);
+
+		// Run uploads with bounded concurrency to avoid spiking memory/network in the extension host.
+		const githubRepository = this._item.githubRepository;
+		const MAX_CONCURRENT_UPLOADS = 3;
+		const queue = uploads.slice();
+		const runOne = async (u: { uri: vscode.Uri; name: string; placeholder: string }) => {
+			try {
+				const markdown = await githubRepository.uploadFile(u.uri, u.name);
+				const completed: FileUploadCompletedMessage = {
+					command: 'pr.file-upload-completed',
+					placeholder: u.placeholder,
+					name: u.name,
+					markdown,
+				};
+				await this._postMessage(completed);
+			} catch (err) {
+				Logger.error(`Failed to upload file ${u.name}: ${formatError(err)}`, IssueOverviewPanel.ID);
+				const completed: FileUploadCompletedMessage = {
+					command: 'pr.file-upload-completed',
+					placeholder: u.placeholder,
+					name: u.name,
+					error: formatError(err),
+				};
+				await this._postMessage(completed);
+			}
+		};
+		const workers: Promise<void>[] = [];
+		for (let i = 0; i < Math.min(MAX_CONCURRENT_UPLOADS, queue.length); i++) {
+			workers.push((async () => {
+				while (queue.length > 0) {
+					const next = queue.shift();
+					if (!next) {
+						break;
+					}
+					await runOne(next);
+				}
+			})());
+		}
+		// Don't await all workers - let them run in the background so this handler returns promptly.
+		Promise.all(workers).catch(err => Logger.error(`Upload worker error: ${formatError(err)}`, IssueOverviewPanel.ID));
+	}
+
 
 	/**
 	 * Process code reference links in bodyHTML. Can be overridden by subclasses (e.g., PullRequestOverviewPanel)
